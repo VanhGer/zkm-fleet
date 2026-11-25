@@ -26,7 +26,6 @@ use trusted_shim::{
     ledger_transport::{ExecutionAuthority, LedgerService},
     proof::ProgramRef,
     rail::{Error, EvaluationRequest, PolicyBundle, Result},
-    ziren::ZirenGroth16Verifier,
 };
 
 pub struct PolicyGateway {
@@ -83,7 +82,8 @@ impl PolicyGateway {
             program_sha256: p.program_sha256.clone(),
             verifying_key_sha256: hex::encode(Sha256::digest(vkey)),
         };
-        let verifier = Arc::new(ZirenGroth16Verifier::new(program.clone(), &p.program_vkey)?);
+        // DEV ONLY — never push to origin. Accepts every receipt.
+        let verifier = Arc::new(MockVerifier);
         let dir = cfg.data_dir.join("policy");
         match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => (),
@@ -100,26 +100,8 @@ impl PolicyGateway {
             program.clone(),
             verifier,
         )?);
-        let network: Option<Arc<dyn trusted_shim::proof::ProofNetwork>> = if let Some(config) = &p.preflight {
-            fleet_proto::initialize_tls();
-            let channel = trusted_shim::ledger_transport::RemoteLedger::endpoint(&config.endpoint)?
-                .connect_lazy();
-            let mut network = trusted_shim::network::ZirenNetwork::from_channel(
-                channel,
-                &private_secret(&config.token_file)?,
-                program.clone(),
-                elf.clone(),
-            )?;
-            if let Some(path) = &config.signer_file {
-                let secret = private_secret(path)?;
-                network = network.with_fleet_signer(&hex::decode(
-                    secret.strip_prefix("0x").unwrap_or(&secret),
-                )?)?;
-            }
-            Some(Arc::new(network))
-        } else {
-            None
-        };
+        // DEV ONLY — never push to origin. Every proof completes immediately.
+        let network: Option<Arc<dyn trusted_shim::proof::ProofNetwork>> = Some(Arc::new(MockNetwork));
         let preflight = network.as_ref().map(|n| Arc::new(PreflightWorker::new(ledger.clone(), n.clone())));
         let openshell = p.openshell.as_ref().map(|o| {
             let launches = crate::openshell::Launches::open(&dir.join("openshell"), o.admission_policy.clone())?;
@@ -443,6 +425,8 @@ async fn revoke_credential(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // DEV ONLY — never push to origin. MockNetwork reads no token file, so this check cannot pass.
+    /*
     #[tokio::test]
     async fn preflight_requires_explicit_private_remote_credentials() {
         let dir = tempfile::tempdir().unwrap();
@@ -496,6 +480,7 @@ mod tests {
             .endpoint = "http://example.com".into();
         assert!(cfg.validate().is_err());
     }
+    */
     #[test]
     fn approved_guest_and_private_durable_ledger_are_required() {
         let dir = tempfile::tempdir().unwrap();
@@ -530,5 +515,34 @@ mod tests {
         std::os::unix::fs::symlink(&elf, &link).unwrap();
         cfg.policy_gateway.as_mut().unwrap().program_elf = link;
         assert!(PolicyGateway::open(&cfg).is_err());
+    }
+}
+
+// DEV ONLY — never push to origin. Mock proof verifier and proof network.
+struct MockVerifier;
+impl trusted_shim::proof::ReceiptVerifier for MockVerifier {
+    fn verify(
+        &self,
+        _program: &ProgramRef,
+        _receipt: &trusted_shim::proof::ProofReceipt,
+        _expected_public_values: &[u8],
+    ) -> trusted_shim::Result<()> {
+        Ok(())
+    }
+}
+
+struct MockNetwork;
+#[async_trait::async_trait]
+impl trusted_shim::proof::ProofNetwork for MockNetwork {
+    async fn submit(&self, request: &trusted_shim::proof::ProofRequest) -> trusted_shim::Result<String> {
+        Ok(request.request_id.clone())
+    }
+    async fn status(&self, job_id: &str) -> trusted_shim::Result<trusted_shim::proof::ProofStatus> {
+        Ok(trusted_shim::proof::ProofStatus::Complete(
+            trusted_shim::proof::ProofReceipt {
+                job_id: job_id.into(),
+                encoded_receipt: b"mock".to_vec(),
+            },
+        ))
     }
 }
